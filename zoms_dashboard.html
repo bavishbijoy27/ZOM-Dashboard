@@ -116,15 +116,30 @@ a.iconlink{margin-right:10px;color:var(--accent);text-decoration:none;font-size:
 </head>
 <body>
 
+<!-- Login screen (shown until an authorized Google account signs in) -->
+<div id="loginScreen" style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);font-family:'Segoe UI',Arial,sans-serif;">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:36px 40px;max-width:360px;width:90%;text-align:center;box-shadow:var(--shadow)">
+    <div style="font-size:18px;font-weight:700;margin-bottom:4px">ZOMS Dashboard</div>
+    <div class="muted" style="margin-bottom:22px">Sign in to continue</div>
+    <button id="btnGoogleSignIn" class="btn primary" style="width:100%;padding:10px;font-size:13.5px">Sign in with Google</button>
+    <div id="loginError" class="flag hidden" style="margin-top:16px;text-align:left"></div>
+    <div id="loginStatus" class="muted" style="margin-top:14px"></div>
+  </div>
+</div>
+
+<div id="appRoot" class="hidden">
 <header class="topbar">
   <div class="title">ZOMS Dashboard<small>Zonal Fee &amp; Ops Tracker — Chennai Zone</small></div>
   <div class="conn-status" id="connStatus"><span class="dot" id="connDot"></span><span id="connText">Checking data file…</span></div>
+  <div class="conn-status" id="cloudStatus"><span class="dot" id="cloudDot"></span><span id="cloudText">Cloud sync idle</span></div>
   <button class="btn" id="btnReconnect" style="display:none">Reconnect data file</button>
   <button class="btn" id="btnConnect">Connect data file</button>
   <button class="btn" id="btnExport">Export all data</button>
   <button class="btn" id="btnImport">Import data</button>
   <input type="file" id="fileImport" accept=".json" style="display:none">
   <button class="btn primary" id="btnUpload">Upload TPND file</button>
+  <span class="muted" id="userEmailLabel" style="margin-left:4px"></span>
+  <button class="btn" id="btnLogout">Log Out</button>
 </header>
 
 <nav class="tabs" id="tabNav">
@@ -195,6 +210,7 @@ a.iconlink{margin-right:10px;color:var(--accent);text-decoration:none;font-size:
     <div class="modal-body" id="opsModalBody"></div>
   </div>
 </div>
+</div><!-- /#appRoot -->
 
 <script>
 /* =========================================================================
@@ -551,7 +567,11 @@ const FSA = {
   },
   async writeState(){
     const json = JSON.stringify(STATE, null, 2);
-    try{ localStorage.setItem('zoms_state_fallback', json); }catch(e){}
+    try{
+      localStorage.setItem('zoms_state_fallback', json);
+      localStorage.setItem('zoms_state_updated_at', String(Date.now()));
+    }catch(e){}
+    try{ if(window.FB && window.FB.syncState) window.FB.syncState(json); }catch(e){}
     if(this.mode==='fsa' && this.handle){
       try{
         const w = await this.handle.createWritable();
@@ -604,6 +624,24 @@ function setSaveStatus(status, err){
     document.getElementById('connDot').className='dot bad';
   } else if(status==='local'){
     text.textContent = 'Saved to local browser storage only • '+new Date().toLocaleTimeString('en-IN');
+  }
+}
+function setCloudStatus(status, info){
+  const dot = document.getElementById('cloudDot');
+  const text = document.getElementById('cloudText');
+  if(!dot || !text) return;
+  if(status==='ok'){
+    dot.className='dot ok';
+    text.textContent = 'Synced to cloud • '+new Date(info).toLocaleTimeString('en-IN');
+  } else if(status==='error'){
+    dot.className='dot bad';
+    text.textContent = 'Cloud sync FAILED: '+info+' (local save still OK)';
+  } else if(status==='warn'){
+    dot.className='dot warn';
+    text.textContent = info;
+  } else {
+    dot.className='dot';
+    text.textContent = 'Cloud sync idle';
   }
 }
 function persist(){ FSA.scheduleWrite(); }
@@ -1846,11 +1884,153 @@ document.getElementById('tabNav').addEventListener('click', e=>{
 });
 
 /* ---------- Boot ---------- */
-(async function boot(){
+/* Invoked by the Firebase auth module script below, once an authorized user is signed in
+   and any newer Firestore data has been pulled into localStorage. */
+async function bootDashboard(){
   await FSA.tryReconnect();
   setConnStatus();
   renderAll();
-})();
+}
+</script>
+
+<!-- =========================================================================
+     Firebase — auth (Google sign-in, restricted to one account) + Firestore
+     cloud sync. This is the modular v9+ SDK, loaded straight from the gstatic
+     CDN via ES module imports (there is no non-module CDN bundle for v9+,
+     so this <script type="module"> block IS the "CDN script tag" for it).
+     It only ever calls into the classic app script above (STATE, hydrateState,
+     renderAll, FSA, setCloudStatus, bootDashboard) — it never touches
+     calculation logic, column mappings, or the Zero-Paid threshold rule.
+     ========================================================================= -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
+import {
+  getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut
+} from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
+import {
+  getFirestore, doc, getDoc, setDoc, serverTimestamp
+} from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAulscJKY8M09D2QKMAUvp6uzIgNFkX-dA",
+  authDomain: "zoms-dashboard.firebaseapp.com",
+  projectId: "zoms-dashboard",
+  storageBucket: "zoms-dashboard.firebasestorage.app",
+  messagingSenderId: "254934799963",
+  appId: "1:254934799963:web:e1e0ec604cea4701b9d17e"
+};
+const ALLOWED_EMAIL = 'bavish.growthgravy@gmail.com';
+const FS_DOC_MAX_CHARS = 900000; // stay under Firestore's ~1MB document cap
+
+const fbApp = initializeApp(firebaseConfig);
+const auth = getAuth(fbApp);
+const db = getFirestore(fbApp);
+const provider = new GoogleAuthProvider();
+
+let currentUser = null;
+
+const loginScreenEl = document.getElementById('loginScreen');
+const appRootEl = document.getElementById('appRoot');
+const loginErrorEl = document.getElementById('loginError');
+const loginStatusEl = document.getElementById('loginStatus');
+const userEmailLabelEl = document.getElementById('userEmailLabel');
+
+function showLoginError(msg){
+  loginErrorEl.textContent = msg;
+  loginErrorEl.classList.remove('hidden');
+}
+function clearLoginError(){
+  loginErrorEl.classList.add('hidden');
+  loginErrorEl.textContent = '';
+}
+
+function docRef(uid){
+  return doc(db, 'users', uid, 'zoms_data', 'state');
+}
+
+// Called by FSA.writeState() (see classic script above) after every localStorage save.
+// Fire-and-forget by design: a Firestore failure must never block or roll back the
+// local save that already succeeded.
+window.FB = {
+  async syncState(json){
+    if(!currentUser) return;
+    if(json.length > FS_DOC_MAX_CHARS){
+      setCloudStatus('warn', 'Data too large to sync to cloud right now (kept in local storage)');
+      return;
+    }
+    try{
+      await setDoc(docRef(currentUser.uid), {
+        stateJson: json,
+        updatedAtMs: Date.now(),
+        updatedAt: serverTimestamp(),
+        email: currentUser.email
+      });
+      setCloudStatus('ok', Date.now());
+    }catch(e){
+      setCloudStatus('error', e.message);
+    }
+  }
+};
+
+// On login: if Firestore has data newer than (or local has none) what's in
+// localStorage, pull it down first so bootDashboard()/FSA.tryReconnect() picks
+// it up via the existing loadFromLocalStorage() path — no new load path needed.
+async function hydrateFromCloudIfNewer(){
+  try{
+    const snap = await getDoc(docRef(currentUser.uid));
+    if(!snap.exists()) return;
+    const cloud = snap.data();
+    if(!cloud || !cloud.stateJson) return;
+    const localJson = localStorage.getItem('zoms_state_fallback');
+    const localTs = Number(localStorage.getItem('zoms_state_updated_at') || 0);
+    const cloudTs = Number(cloud.updatedAtMs || 0);
+    if(!localJson || cloudTs > localTs){
+      localStorage.setItem('zoms_state_fallback', cloud.stateJson);
+      localStorage.setItem('zoms_state_updated_at', String(cloudTs || Date.now()));
+      setCloudStatus('ok', cloudTs || Date.now());
+    }
+  }catch(e){
+    // Offline or blocked — fall back silently to whatever is already in localStorage.
+    console.warn('Firestore hydrate check failed, using local data:', e.message);
+  }
+}
+
+document.getElementById('btnGoogleSignIn').addEventListener('click', async ()=>{
+  clearLoginError();
+  loginStatusEl.textContent = '';
+  try{
+    await signInWithPopup(auth, provider);
+  }catch(e){
+    showLoginError('Sign-in failed: '+e.message);
+  }
+});
+
+document.getElementById('btnLogout').addEventListener('click', async ()=>{
+  try{ await signOut(auth); }catch(e){}
+  location.reload();
+});
+
+onAuthStateChanged(auth, async (user)=>{
+  if(!user){
+    currentUser = null;
+    appRootEl.classList.add('hidden');
+    loginScreenEl.classList.remove('hidden');
+    return;
+  }
+  if(user.email !== ALLOWED_EMAIL){
+    showLoginError('Access is restricted to an authorized account. Signed in as '+user.email+'.');
+    await signOut(auth);
+    return;
+  }
+  currentUser = user;
+  clearLoginError();
+  loginStatusEl.textContent = 'Signed in as '+user.email+' — loading data…';
+  userEmailLabelEl.textContent = user.email;
+  await hydrateFromCloudIfNewer();
+  loginScreenEl.classList.add('hidden');
+  appRootEl.classList.remove('hidden');
+  await bootDashboard();
+});
 </script>
 </body>
 </html>
