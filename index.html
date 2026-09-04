@@ -80,6 +80,10 @@ tr:hover td{background:#fafbfc}
 .badge-gray{background:var(--gray-bg);color:var(--gray)}
 .badge-blue{background:var(--accent-dim);color:var(--accent)}
 
+tr.row-red td{background:var(--red-bg)}
+tr.row-amber td{background:var(--amber-bg)}
+tr.row-green td{background:var(--green-bg)}
+
 .calc{color:var(--calc);cursor:pointer;border-bottom:1px dotted var(--calc)}
 .calc:hover{background:var(--accent-dim)}
 
@@ -306,7 +310,9 @@ let STATE = {
   columnMappingOverrides: { academic:{}, transport:{} },
   snapshots: [],   // {id,type,pullDate,uploadedAt,sourceFileName,rawRowCount,uniqueCount,headerEchoCount,blankCodeCount,dupCount,rows:[...]}
   ops: [],
-  prm: []
+  prm: [],
+  contacts: [],    // {id, branch, name, role, phone}
+  prmTargets: []   // {id, week, branch, prm, target, actual}
 };
 
 let CALC_REGISTRY = {};
@@ -556,26 +562,56 @@ const FSA = {
     }
   },
   loadFromLocalStorage(){
+    // Two independent keys: 'zoms_state_fallback' (heavy — config/columnMappingOverrides/snapshots,
+    // i.e. TPND data) and 'zoms_ops_fallback' (light — ops/prm/contacts/prmTargets). Kept separate so a
+    // huge TPND dataset can never block or evict the small Ops Tracker data (see FSA.writeState below).
+    // Falls back to reading ops/prm out of the legacy combined blob if the light key hasn't been written
+    // yet (e.g. right after this split first ships), so no pre-existing Ops Tracker data is lost.
     try{
       const text = localStorage.getItem('zoms_state_fallback');
-      if(text) hydrateState(JSON.parse(text));
-    }catch(e){}
+      const heavy = text ? JSON.parse(text) : null;
+      let light = null;
+      try{
+        const lightText = localStorage.getItem('zoms_ops_fallback');
+        if(lightText) light = JSON.parse(lightText);
+      }catch(e){
+        console.error('[ZOMS] Could not parse local Ops/PRM data — falling back to combined blob if present:', e.message);
+      }
+      if(heavy || light) hydrateState(Object.assign({}, heavy, light));
+    }catch(e){
+      console.error('[ZOMS] Could not load locally-saved data:', e.message);
+    }
   },
   scheduleWrite(){
     clearTimeout(this.writeTimer);
     this.writeTimer = setTimeout(()=>this.writeState(), 700);
   },
   async writeState(){
-    const json = JSON.stringify(STATE, null, 2);
+    // Split in two so Ops Tracker (+ PRM + Branch Contacts) always saves/syncs on its own, even when the
+    // TPND snapshot data is too large to fit in a single localStorage write or Firestore document.
+    const heavy = {version: STATE.version, config: STATE.config, columnMappingOverrides: STATE.columnMappingOverrides, snapshots: STATE.snapshots};
+    const light = {ops: STATE.ops, prm: STATE.prm, contacts: STATE.contacts, prmTargets: STATE.prmTargets};
+    const heavyJson = JSON.stringify(heavy, null, 2);
+    const lightJson = JSON.stringify(light, null, 2);
+    const fullJson = JSON.stringify(STATE, null, 2); // only for the optional connected-file backup — an on-disk file has no browser quota to worry about
+
     try{
-      localStorage.setItem('zoms_state_fallback', json);
+      localStorage.setItem('zoms_ops_fallback', lightJson);
+      localStorage.setItem('zoms_ops_updated_at', String(Date.now()));
+    }catch(e){
+      console.error('[ZOMS] Ops/PRM/Contacts local save FAILED — this should basically never happen (tiny payload):', e.message);
+    }
+    try{
+      localStorage.setItem('zoms_state_fallback', heavyJson);
       localStorage.setItem('zoms_state_updated_at', String(Date.now()));
-    }catch(e){}
-    try{ if(window.FB && window.FB.syncState) window.FB.syncState(json); }catch(e){}
+    }catch(e){
+      console.error('[ZOMS] TPND/settings local save failed (likely localStorage quota — large snapshot history). Ops/PRM/Contacts above already saved fine:', e.message);
+    }
+    try{ if(window.FB && window.FB.syncState) window.FB.syncState(heavyJson, lightJson); }catch(e){}
     if(this.mode==='fsa' && this.handle){
       try{
         const w = await this.handle.createWritable();
-        await w.write(json);
+        await w.write(fullJson);
         await w.close();
         setSaveStatus('ok');
       }catch(e){
@@ -588,14 +624,16 @@ const FSA = {
 };
 
 function hydrateState(obj, replace){
-  const base = replace ? {version:1, config:JSON.parse(JSON.stringify(DEFAULT_CONFIG)), columnMappingOverrides:{academic:{},transport:{}}, snapshots:[], ops:[], prm:[]} : STATE;
+  const base = replace ? {version:1, config:JSON.parse(JSON.stringify(DEFAULT_CONFIG)), columnMappingOverrides:{academic:{},transport:{}}, snapshots:[], ops:[], prm:[], contacts:[], prmTargets:[]} : STATE;
   STATE = Object.assign(base, {
     version: obj.version || 1,
     config: Object.assign(JSON.parse(JSON.stringify(DEFAULT_CONFIG)), obj.config||{}),
     columnMappingOverrides: obj.columnMappingOverrides || {academic:{},transport:{}},
     snapshots: obj.snapshots || [],
     ops: obj.ops || [],
-    prm: obj.prm || []
+    prm: obj.prm || [],
+    contacts: obj.contacts || [],
+    prmTargets: obj.prmTargets || []
   });
 }
 
@@ -1563,20 +1601,172 @@ function renderZeroPaid(){
 function renderOps(){
   const el = document.getElementById('tab-ops');
   let html = `<div class="panel"><div class="panelhead"><h3 style="margin:0">Ops Tracker</h3><span class="spacer"></span><button class="btn primary" onclick="openOpsEditor()">+ New issue</button></div>
+    <p class="muted">Row color reflects deadline urgency — green: more than 7 days away, amber: within 7 days, red: overdue. No deadline set = no color (not treated as urgent).</p>
     <div class="tablewrap"><table><thead><tr><th>Branch</th><th>Description</th><th>Raised</th><th>Deadline</th><th>Status</th><th></th></tr></thead><tbody>`;
   const sorted = STATE.ops.slice().sort((a,b)=>(a.deadline||'').localeCompare(b.deadline||''));
   sorted.forEach(issue=>{
     const u = urgencyInfo(issue);
-    html += `<tr><td>${U.esc(issue.branch)}</td><td>${U.esc(issue.description)}</td><td>${U.fmtDate(issue.dateRaised)}</td><td>${U.fmtDate(issue.deadline)}</td>
+    const rowCls = u.cls==='badge-red' ? 'row-red' : u.cls==='badge-amber' ? 'row-amber' : u.cls==='badge-green' ? 'row-green' : '';
+    html += `<tr class="${rowCls}"><td>${U.esc(issue.branch)}</td><td>${U.esc(issue.description)}</td><td>${U.fmtDate(issue.dateRaised)}</td><td>${issue.deadline?U.fmtDate(issue.deadline):'<span class="muted">none</span>'}</td>
       <td><span class="badge ${u.cls}">${issue.status}${issue.status!=='Resolved'&&issue.status!=='Closed'?' · '+u.label:''}</span></td>
       <td>${telLink(issue.phone)}${waLink(issue.phone)}<span class="link-inline" onclick="openOpsEditor('${issue.id}')">Open</span></td></tr>`;
   });
   if(!sorted.length) html += `<tr><td colspan="6" class="muted">No issues logged yet.</td></tr>`;
   html += `</tbody></table></div></div>`;
+
+  html += renderContactsPanel();
+  html += renderPrmTargetsPanel();
+
   el.innerHTML = html;
+  wireContactsPanel();
+  wirePrmTargetsPanel();
 }
+
+/* ---------- Ops Tracker: Branch Contacts (click-to-call / click-to-WhatsApp) ---------- */
+let CONTACT_EDITING_ID = null;
+function renderContactsPanel(){
+  const rows = STATE.contacts.slice().sort((a,b)=> a.branch.localeCompare(b.branch) || a.name.localeCompare(b.name));
+  return `<div class="panel">
+    <h3>Branch Contacts</h3>
+    <p class="muted">${CONTACT_EDITING_ID?'Editing an existing contact — Save to update it.':'One entry per person. Add a phone number to get one-tap Call and WhatsApp links.'}</p>
+    <div class="formrow">
+      <label>Branch<select id="ctBranch">${BRANCHES.map(b=>`<option>${b}</option>`).join('')}</select></label>
+      <label>Name<input type="text" id="ctName" placeholder="e.g. Ramesh"></label>
+      <label>Role (optional)<input type="text" id="ctRole" placeholder="e.g. Branch Manager"></label>
+      <label>Phone<input type="tel" id="ctPhone" placeholder="91XXXXXXXXXX"></label>
+      <button class="btn primary" id="ctSave">${CONTACT_EDITING_ID?'Update contact':'Add contact'}</button>
+      ${CONTACT_EDITING_ID?'<button class="btn" id="ctCancelEdit">Cancel</button>':''}
+    </div>
+    <div class="tablewrap"><table><thead><tr><th>Branch</th><th>Name</th><th>Role</th><th>Phone</th><th></th></tr></thead><tbody>
+    ${rows.map(c=>`<tr><td>${U.esc(c.branch)}</td><td>${U.esc(c.name)}</td><td>${U.esc(c.role||'')}</td>
+      <td>${telLink(c.phone)}${waLink(c.phone)}${!c.phone?'<span class="muted">no phone</span>':''}</td>
+      <td><span class="link-inline" onclick="editContact('${c.id}')">Edit</span> · <span class="link-inline" onclick="deleteContact('${c.id}')">Delete</span></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No branch contacts added yet.</td></tr>'}
+    </tbody></table></div>
+  </div>`;
+}
+function wireContactsPanel(){
+  document.getElementById('ctSave').onclick = saveContact;
+  const cancelBtn = document.getElementById('ctCancelEdit');
+  if(cancelBtn) cancelBtn.onclick = ()=>{ CONTACT_EDITING_ID=null; renderOps(); };
+  if(CONTACT_EDITING_ID){
+    const c = STATE.contacts.find(x=>x.id===CONTACT_EDITING_ID);
+    if(c){
+      document.getElementById('ctBranch').value = c.branch;
+      document.getElementById('ctName').value = c.name;
+      document.getElementById('ctRole').value = c.role||'';
+      document.getElementById('ctPhone').value = c.phone||'';
+    }
+  }
+}
+function saveContact(){
+  const name = document.getElementById('ctName').value.trim();
+  if(!name){ alert('Name is required.'); return; }
+  const entry = {
+    id: CONTACT_EDITING_ID || U.uid(),
+    branch: document.getElementById('ctBranch').value,
+    name,
+    role: document.getElementById('ctRole').value.trim(),
+    phone: document.getElementById('ctPhone').value.trim()
+  };
+  if(CONTACT_EDITING_ID){
+    const idx = STATE.contacts.findIndex(c=>c.id===CONTACT_EDITING_ID);
+    if(idx>=0) STATE.contacts[idx]=entry;
+    CONTACT_EDITING_ID=null;
+  } else {
+    STATE.contacts.push(entry);
+  }
+  persist(); renderOps();
+}
+function editContact(id){ CONTACT_EDITING_ID=id; renderOps(); }
+async function deleteContact(id){
+  const ok = await confirmDialog('Delete this contact?', 'This cannot be undone.');
+  if(!ok) return;
+  STATE.contacts = STATE.contacts.filter(c=>c.id!==id);
+  if(CONTACT_EDITING_ID===id) CONTACT_EDITING_ID=null;
+  persist(); renderOps();
+}
+
+/* ---------- Ops Tracker: PRM Weekly Admissions — Target vs Actual ---------- */
+let PRMTGT_EDITING_ID = null;
+function prmTargetUniqueKey(t){ return t.week+'|'+t.branch+'|'+U.norm(t.prm); }
+function renderPrmTargetsPanel(){
+  const rows = STATE.prmTargets.slice().sort((a,b)=> b.week.localeCompare(a.week) || a.branch.localeCompare(b.branch) || a.prm.localeCompare(b.prm));
+  return `<div class="panel">
+    <h3>PRM Weekly Admissions — Target vs Actual</h3>
+    <p class="muted" id="ptEditingNote">${PRMTGT_EDITING_ID?'Editing an existing entry — Save to update it, or change Week/Branch/PRM to save as a new entry instead.':'One row is kept per PRM per branch per week. Saving with the same Week + Branch + PRM as an existing entry updates it rather than duplicating.'}</p>
+    <div class="formrow">
+      <label>Week starting<input type="date" id="ptWeek" value="${U.todayISO()}"></label>
+      <label>Branch<select id="ptBranch">${BRANCHES.map(b=>`<option>${b}</option>`).join('')}</select></label>
+      <label>PRM name<input type="text" id="ptPrm" list="prmNamesList" placeholder="e.g. Priya"></label>
+      <label>Target admissions<input type="number" id="ptTarget" min="0" value="0" style="width:110px"></label>
+      <label>Actual admissions<input type="number" id="ptActual" min="0" value="0" style="width:110px"></label>
+      <button class="btn primary" id="ptSave">${PRMTGT_EDITING_ID?'Update entry':'Save entry'}</button>
+      ${PRMTGT_EDITING_ID?'<button class="btn" id="ptCancelEdit">Cancel edit</button>':''}
+    </div>
+    <div class="tablewrap"><table><thead><tr><th>Week</th><th>Branch</th><th>PRM</th><th class="num">Target</th><th class="num">Actual</th><th class="num">Gap</th><th class="num">% Achieved</th><th></th></tr></thead><tbody>
+    ${rows.map(t=>{
+      const gap = U.num(t.actual)-U.num(t.target);
+      const pct = U.num(t.target)>0 ? U.num(t.actual)/U.num(t.target)*100 : null;
+      const gapCls = gap>=0?'badge-green':'badge-red';
+      return `<tr><td>${U.fmtDate(t.week)}</td><td>${U.esc(t.branch)}</td><td>${U.esc(t.prm)}</td>
+        <td class="num">${t.target}</td><td class="num">${t.actual}</td>
+        <td class="num"><span class="badge ${gapCls}">${gap>=0?'+':''}${gap}</span></td>
+        <td class="num">${pct!==null?U.pct(pct,0):'N/A'}</td>
+        <td><span class="link-inline" onclick="editPrmTarget('${t.id}')">Edit</span> · <span class="link-inline" onclick="deletePrmTarget('${t.id}')">Delete</span></td></tr>`;
+    }).join('') || '<tr><td colspan="8" class="muted">No weekly targets logged yet.</td></tr>'}
+    </tbody></table></div>
+  </div>`;
+}
+function wirePrmTargetsPanel(){
+  document.getElementById('ptSave').onclick = savePrmTarget;
+  const cancelBtn = document.getElementById('ptCancelEdit');
+  if(cancelBtn) cancelBtn.onclick = ()=>{ PRMTGT_EDITING_ID=null; renderOps(); };
+  if(PRMTGT_EDITING_ID){
+    const t = STATE.prmTargets.find(x=>x.id===PRMTGT_EDITING_ID);
+    if(t){
+      document.getElementById('ptWeek').value = t.week;
+      document.getElementById('ptBranch').value = t.branch;
+      document.getElementById('ptPrm').value = t.prm;
+      document.getElementById('ptTarget').value = t.target;
+      document.getElementById('ptActual').value = t.actual;
+    }
+  }
+}
+function savePrmTarget(){
+  const week = document.getElementById('ptWeek').value;
+  const prm = document.getElementById('ptPrm').value.trim();
+  if(!week || !prm){ alert('Week and PRM name are required.'); return; }
+  const entry = {
+    id: PRMTGT_EDITING_ID || U.uid(),
+    week,
+    branch: document.getElementById('ptBranch').value,
+    prm,
+    target: U.num(document.getElementById('ptTarget').value),
+    actual: U.num(document.getElementById('ptActual').value)
+  };
+  if(PRMTGT_EDITING_ID){
+    const idx = STATE.prmTargets.findIndex(t=>t.id===PRMTGT_EDITING_ID);
+    if(idx>=0) STATE.prmTargets[idx]=entry;
+    PRMTGT_EDITING_ID=null;
+  } else {
+    const key = prmTargetUniqueKey(entry);
+    const existingIdx = STATE.prmTargets.findIndex(t=>prmTargetUniqueKey(t)===key);
+    if(existingIdx>=0) STATE.prmTargets[existingIdx]=entry; // same PRM+branch+week = correction, not a duplicate
+    else STATE.prmTargets.push(entry);
+  }
+  persist(); renderOps();
+}
+function editPrmTarget(id){ PRMTGT_EDITING_ID=id; renderOps(); }
+async function deletePrmTarget(id){
+  const ok = await confirmDialog('Delete this target entry?', 'This cannot be undone.');
+  if(!ok) return;
+  STATE.prmTargets = STATE.prmTargets.filter(t=>t.id!==id);
+  if(PRMTGT_EDITING_ID===id) PRMTGT_EDITING_ID=null;
+  persist(); renderOps();
+}
+
 function openOpsEditor(id){
-  const issue = id ? STATE.ops.find(i=>i.id===id) : {id:U.uid(), branch:BRANCHES[0], description:'', dateRaised:U.todayISO(), deadline:U.todayISO(), status:'Open', phone:'', updates:[]};
+  const issue = id ? STATE.ops.find(i=>i.id===id) : {id:U.uid(), branch:BRANCHES[0], description:'', dateRaised:U.todayISO(), deadline:'', status:'Open', phone:'', updates:[]};
   const isNewIssue = !id;
   document.getElementById('opsModalTitle').textContent = isNewIssue ? 'New issue' : 'Issue detail';
   document.getElementById('opsModalBody').innerHTML = `
@@ -1584,7 +1774,7 @@ function openOpsEditor(id){
       <label>Branch<select id="opBranch">${BRANCHES.map(b=>`<option ${issue.branch===b?'selected':''}>${b}</option>`).join('')}</select></label>
       <label>Status<select id="opStatus">${['Open','In Progress','Resolved','Closed'].map(s=>`<option ${issue.status===s?'selected':''}>${s}</option>`).join('')}</select></label>
       <label>Date raised<input type="date" id="opRaised" value="${issue.dateRaised}"></label>
-      <label>Deadline<input type="date" id="opDeadline" value="${issue.deadline}"></label>
+      <label>Deadline (optional)<input type="date" id="opDeadline" value="${issue.deadline||''}"></label>
       <label>Phone (optional)<input type="tel" id="opPhone" value="${U.esc(issue.phone||'')}" placeholder="91XXXXXXXXXX"></label>
     </div>
     ${issue.phone?`<div class="formrow" style="margin-top:-4px">${telLink(issue.phone)}${waLink(issue.phone)}</div>`:''}
@@ -1947,20 +2137,41 @@ function clearLoginError(){
 function docRef(uid){
   return doc(db, 'users', uid, 'zoms_data', 'state');
 }
+// Separate document for Ops Tracker + PRM Tracker + Branch Contacts + PRM weekly targets — small,
+// operational data that must sync independently of the (potentially large) TPND snapshot document
+// above, so a big TPND upload can never block or delay an Ops Tracker save.
+function opsDocRef(uid){
+  return doc(db, 'users', uid, 'zoms_data', 'ops');
+}
 
 // Called by FSA.writeState() (see classic script above) after every localStorage save.
 // Fire-and-forget by design: a Firestore failure must never block or roll back the
-// local save that already succeeded.
+// local save that already succeeded. The ops/prm sync runs first and independently of the
+// heavy TPND sync, so it is never skipped or delayed by the heavy side being oversized.
 window.FB = {
-  async syncState(json){
+  async syncState(heavyJson, lightJson){
     if(!currentUser) return;
-    if(json.length > FS_DOC_MAX_CHARS){
-      setCloudStatus('warn', 'Data too large to sync to cloud right now (kept in local storage)');
+    try{
+      if(lightJson.length > FS_DOC_MAX_CHARS){
+        console.error('[ZOMS] Ops/PRM/Contacts data unexpectedly large for a single Firestore doc:', lightJson.length);
+      } else {
+        await setDoc(opsDocRef(currentUser.uid), {
+          opsJson: lightJson,
+          updatedAtMs: Date.now(),
+          updatedAt: serverTimestamp(),
+          email: currentUser.email
+        });
+      }
+    }catch(e){
+      console.error('[ZOMS] Ops/PRM/Contacts cloud sync failed:', e.message);
+    }
+    if(heavyJson.length > FS_DOC_MAX_CHARS){
+      setCloudStatus('warn', 'TPND data too large to sync to cloud right now (Ops/PRM/Contacts still synced fine; TPND kept in local storage)');
       return;
     }
     try{
       await setDoc(docRef(currentUser.uid), {
-        stateJson: json,
+        stateJson: heavyJson,
         updatedAtMs: Date.now(),
         updatedAt: serverTimestamp(),
         email: currentUser.email
@@ -1975,24 +2186,45 @@ window.FB = {
 // On login: if Firestore has data newer than (or local has none) what's in
 // localStorage, pull it down first so bootDashboard()/FSA.tryReconnect() picks
 // it up via the existing loadFromLocalStorage() path — no new load path needed.
+// The two documents (heavy TPND state, light ops/prm/contacts) are pulled independently so one
+// being missing/stale never blocks the other.
 async function hydrateFromCloudIfNewer(){
   try{
     const snap = await getDoc(docRef(currentUser.uid));
-    if(!snap.exists()) return;
-    const cloud = snap.data();
-    if(!cloud || !cloud.stateJson) return;
-    const localJson = localStorage.getItem('zoms_state_fallback');
-    const localTs = Number(localStorage.getItem('zoms_state_updated_at') || 0);
-    const cloudTs = Number(cloud.updatedAtMs || 0);
-    if(!localJson || cloudTs > localTs){
-      localStorage.setItem('zoms_state_fallback', cloud.stateJson);
-      localStorage.setItem('zoms_state_updated_at', String(cloudTs || Date.now()));
-      setCloudStatus('ok', cloudTs || Date.now());
+    if(snap.exists()){
+      const cloud = snap.data();
+      if(cloud && cloud.stateJson){
+        const localJson = localStorage.getItem('zoms_state_fallback');
+        const localTs = Number(localStorage.getItem('zoms_state_updated_at') || 0);
+        const cloudTs = Number(cloud.updatedAtMs || 0);
+        if(!localJson || cloudTs > localTs){
+          localStorage.setItem('zoms_state_fallback', cloud.stateJson);
+          localStorage.setItem('zoms_state_updated_at', String(cloudTs || Date.now()));
+        }
+      }
     }
   }catch(e){
     // Offline or blocked — fall back silently to whatever is already in localStorage.
-    console.warn('Firestore hydrate check failed, using local data:', e.message);
+    console.warn('Firestore TPND/settings hydrate check failed, using local data:', e.message);
   }
+  try{
+    const opsSnap = await getDoc(opsDocRef(currentUser.uid));
+    if(opsSnap.exists()){
+      const cloud = opsSnap.data();
+      if(cloud && cloud.opsJson){
+        const localJson = localStorage.getItem('zoms_ops_fallback');
+        const localTs = Number(localStorage.getItem('zoms_ops_updated_at') || 0);
+        const cloudTs = Number(cloud.updatedAtMs || 0);
+        if(!localJson || cloudTs > localTs){
+          localStorage.setItem('zoms_ops_fallback', cloud.opsJson);
+          localStorage.setItem('zoms_ops_updated_at', String(cloudTs || Date.now()));
+        }
+      }
+    }
+  }catch(e){
+    console.warn('Firestore Ops/PRM/Contacts hydrate check failed, using local data:', e.message);
+  }
+  setCloudStatus('ok', Date.now());
 }
 
 document.getElementById('btnGoogleSignIn').addEventListener('click', async ()=>{
